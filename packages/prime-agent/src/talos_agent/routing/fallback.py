@@ -9,11 +9,13 @@ successes/failures on the appropriate breakers.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
 from talos_agent.circuit_breaker import CircuitBreakerOpen, cb_registry
+from talos_agent.http import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -118,14 +120,20 @@ class FallbackChain:
             breaker = cb_registry.get(provider_name)
             if not await breaker.allow_request():
                 cooldown = breaker.remaining_cooldown() or 0.0
-                msg = f"Circuit breaker OPEN (retry in {cooldown:.1f}s)"
+                msg = redact_text(f"Circuit breaker OPEN (retry in {cooldown:.1f}s)")
                 attempts.append((provider_name, msg))
                 logger.warning(
-                    "Fallback skipping '%s' — %s",
+                    "Fallback skipping '%s' [state=open, attempt=%d] — %s",
                     provider_name,
+                    len(attempts),
                     msg,
                 )
                 continue
+
+            # Read after allow_request() so a recovery probe is logged as
+            # half_open rather than open.
+            probe_state = breaker.state.value
+            started = time.monotonic()
 
             try:
                 result = await operation(provider_name, *args, **kwargs)
@@ -144,11 +152,16 @@ class FallbackChain:
                 )
             except CircuitBreakerOpen as exc:
                 await breaker.record_failure()
-                attempts.append((provider_name, str(exc)))
+                exc_msg = _summarise_exception(exc)
+                attempts.append((provider_name, exc_msg))
                 logger.warning(
-                    "Fallback: '%s' rejected by circuit breaker — %s",
+                    "Fallback: '%s' rejected by circuit breaker "
+                    "[state=%s, attempt=%d, elapsed=%.1fms] — %s",
                     provider_name,
-                    exc,
+                    probe_state,
+                    len(attempts),
+                    (time.monotonic() - started) * 1000,
+                    exc_msg,
                 )
                 continue
             except Exception as exc:
@@ -156,8 +169,11 @@ class FallbackChain:
                 exc_msg = _summarise_exception(exc)
                 attempts.append((provider_name, exc_msg))
                 logger.warning(
-                    "Fallback: '%s' failed — %s",
+                    "Fallback: '%s' failed [state=%s, attempt=%d, elapsed=%.1fms] — %s",
                     provider_name,
+                    probe_state,
+                    len(attempts),
+                    (time.monotonic() - started) * 1000,
                     exc_msg,
                 )
 
@@ -190,9 +206,14 @@ class FallbackChain:
 
 
 def _summarise_exception(exc: Exception) -> str:
-    """Return a concise, safe summary of an exception for logging."""
+    """Return a concise, redacted summary of an exception for logging.
+
+    Redaction runs before truncation so a secret cannot survive by sitting
+    past the 200-character cut. The result is also what ends up in
+    ``FallbackResult.attempts``, so callers that persist it stay safe.
+    """
     exc_type = type(exc).__name__
-    msg = str(exc)
+    msg = redact_text(str(exc))
     # Truncate long messages to avoid log floods
     if len(msg) > 200:
         msg = msg[:197] + "..."
