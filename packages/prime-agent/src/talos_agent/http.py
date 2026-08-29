@@ -81,10 +81,35 @@ class RetryableHTTPError(Exception):
         super().__init__(f"HTTP {response.status_code} from {url}")
 
 
+# Substring match on key names, so prefixed and nested variants like
+# "x-payment-signature" and "stripe_api_key" are caught, not just exact names.
+# Kept narrow on purpose: "payment_status" and "authenticated" are diagnostics,
+# not secrets.
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|apikey|authorization|auth[_-]?(?:token|header)"
+    r"|secret|password|passwd|private[_-]?key|seed|mnemonic|signature|credential"
+    r"|x-payment|payment[_-]?(?:header|proof|payload|signature|token|secret|key)"
+    r"|token)"
+)
+
+# Token counts are usage metadata and must survive redaction.
+_TOKEN_COUNT_KEY_RE = re.compile(
+    r"(?i)^(total|prompt|completion|input|output|cached|reasoning)?[_-]?tokens?"
+    r"([_-](count|used|remaining))?$"
+)
+
+
+def _is_sensitive_field(key: str) -> bool:
+    """Whether a JSON or header key's value must be redacted before logging."""
+    if _TOKEN_COUNT_KEY_RE.match(key):
+        return False
+    return key.lower() in SECRET_FIELD_NAMES or bool(_SENSITIVE_KEY_RE.search(key))
+
+
 def _sanitize_json_value(value: object) -> object:
     if isinstance(value, dict):
         return {
-            key: ("[REDACTED]" if key.lower() in SECRET_FIELD_NAMES else _sanitize_json_value(val))
+            key: ("[REDACTED]" if _is_sensitive_field(str(key)) else _sanitize_json_value(val))
             for key, val in value.items()
         }
     if isinstance(value, list):
@@ -113,14 +138,37 @@ def _sanitize_response_text(text: str) -> str:
         sanitized,
     )
     sanitized = re.sub(r"S[A-Z2-7]{55}", "[REDACTED]", sanitized)
+    # x402 payment headers in plain-text messages. The JSON branch above only
+    # sees parsed keys, so "X-PAYMENT: eyJhbGciOi..." needs its own rule.
     sanitized = re.sub(
-        r"""(?i)(?:api[_-]?key|token|secret|authorization|password|private[_-]?key)["'`]?\s*[:=]\s*["'`]([^"'`\s]+)["'`]?""",
+        r"""(?i)\b(x-payment[a-z-]*)["'`]?\s*[:=]\s*["'`]?[A-Za-z0-9\-._~+/]+=*""",
+        r"\1: [REDACTED]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        # Quotes around the value are optional. They used to be required, so
+        # an unquoted api_key=sk-live-... in an exception message leaked.
+        # Only known-sensitive *_key prefixes, plus the URL query form ?key=.
+        # A generic "key" would swallow idempotency_key and primary_key.
+        r"""(?i)(?:(?:api|secret|private|signing|encryption|master|access|session|issuer)[_-]?key"""
+        r"""|[?&]key|token|secret|authorization|password)"""
+        r"""["'`]?\s*[:=]\s*["'`]?([^"'`\s,;)}\]]+)["'`]?""",
         lambda m: f"{m.group(0).split(m.group(1))[0]}[REDACTED]",
         sanitized,
     )
     if len(sanitized) > LOG_RESPONSE_SUMMARY_MAX_CHARS:
         return sanitized[: LOG_RESPONSE_SUMMARY_MAX_CHARS - 1] + "…"
     return sanitized
+
+
+def redact_text(text: str) -> str:
+    """Redact secrets from free-form text before it reaches a log line.
+
+    Public entry point over the response-body sanitizer, so retry and
+    circuit-breaker diagnostics reuse these rules rather than growing a
+    second set that drifts.
+    """
+    return _sanitize_response_text(text)
 
 
 def _extract_safe_response_summary(response: httpx.Response) -> str | None:
